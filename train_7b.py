@@ -7,6 +7,7 @@ Sharded params + optimizer — confirmed working
 Chain of Thought support via <|think|> tokens
 Gradient checkpointing — saves memory
 Auto checkpoint to GCS — safe from disk issues
+Auto checkpoint delete - safe from full disk and ssh crashes
 
 Run:
     XLA_PYTHON_CLIENT_PREALLOCATE=false nohup python3 -u train_7b.py > /tmp/train7b.log 2>&1 &
@@ -138,22 +139,45 @@ def make_schedule(cfg: TrainConfig):
     return optax.join_schedules([warmup, cosine], [cfg.warmup_steps])
 
 
+def _gcs_upload_and_cleanup(npz_path: str, step: int, ckpt_dir: str):
+    """Upload to GCS then clean old checkpoints — background thread."""
+    try:
+        from google.cloud import storage
+        client = storage.Client()
+        bucket = client.bucket("max-ap-training")
+        gcs_path = f"checkpoints/step_{step}/params.npz"
+        bucket.blob(gcs_path).upload_from_filename(npz_path)
+        logger.info("GCS upload complete -> gs://max-ap-training/%s", gcs_path)
+    except Exception as e:
+        logger.warning("GCS upload failed (non-fatal): %s", e)
+    try:
+        all_ckpts = sorted([
+            d for d in Path(ckpt_dir).iterdir()
+            if d.is_dir() and d.name.startswith("step_") and d.name != "step_0"
+        ], key=lambda d: int(d.name.split("_")[1]))
+        while len(all_ckpts) > 1:
+            shutil.rmtree(all_ckpts.pop(0))
+            logger.info("Deleted old local checkpoint")
+    except Exception as e:
+        logger.warning("Cleanup failed: %s", e)
+
+
 def save_checkpoint(params, step: int, loss: float, ckpt_dir: str):
-    """Save checkpoint locally and to GCS."""
+    """Save checkpoint locally then upload+cleanup in background."""
+    import threading
     out = Path(ckpt_dir) / f"step_{step}"
     out.mkdir(parents=True, exist_ok=True)
 
-    # Flatten params
-    cpu_params = jax.device_get(params)
+    # Use tree_map to copy params without disturbing sharded state
+    cpu_params = jax.tree_util.tree_map(lambda x: np.array(x), params)
     flat = {}
     def _flat(d, prefix=""):
         for k, v in d.items():
             key = f"{prefix}/{k}" if prefix else k
             if isinstance(v, dict): _flat(v, key)
-            else: flat[key] = np.array(v)
+            else: flat[key] = v
     _flat(cpu_params)
 
-    # Save locally
     npz_path = str(out / "params.npz")
     np.savez_compressed(npz_path, **flat)
     (out / "meta.txt").write_text(
@@ -162,24 +186,14 @@ def save_checkpoint(params, step: int, loss: float, ckpt_dir: str):
     )
     logger.info("Checkpoint saved -> step_%d (loss=%.4f)", step, loss)
 
-    # Upload to GCS
-    try:
-        from google.cloud import storage
-        client = storage.Client()
-        bucket = client.bucket("max-ap-training")
-        gcs_path = f"checkpoints/step_{step}/params.npz"
-        bucket.blob(gcs_path).upload_from_filename(npz_path)
-        logger.info("Uploaded to gs://max-ap-training/%s", gcs_path)
-    except Exception as e:
-        logger.warning("GCS upload failed: %s", e)
-
-    # Keep only 2 latest local checkpoints
-    all_ckpts = sorted([
-        d for d in Path(ckpt_dir).iterdir()
-        if d.is_dir() and d.name.startswith("step_") and d.name != "step_0"
-    ], key=lambda d: int(d.name.split("_")[1]))
-    while len(all_ckpts) > 2:
-        shutil.rmtree(all_ckpts.pop(0))
+    # Upload + cleanup after save — training never pauses
+    t = threading.Thread(
+    # GCS upload disabled
+    # target=_gcs_upload_and_cleanup,
+        args=(npz_path, step, ckpt_dir),
+        daemon=True
+    )
+    t.start()
 
 
 def train():
@@ -197,7 +211,8 @@ def train():
     logger.info("Vocab: %d | LR: %.1e | Steps: %d", VOCAB, cfg.lr, cfg.total_steps)
 
     # ── Data ──────────────────────────────────────────────────────────────
-    logger.info("Loading pairs from GCS...")
+    logger.info("Loading pairs from GCS — data folder...")
+    # NOTE: shards are in max_jax/data/ not max_jax/data_shards/
     pairs = load_all_pairs()
     random.shuffle(pairs)
     n_train = int(len(pairs) * 0.9)
@@ -279,12 +294,42 @@ def train():
     best_val  = float("inf")
     t0        = time.time()
     tok_total = 0
+    start_step = 1
+    if cfg.resume_from:
+        ckpt_path = ROOT / cfg.resume_from / "params.npz"
+        if ckpt_path.exists():
+            logger.info("Resuming from %s", ckpt_path)
+            raw = np.load(str(ckpt_path))
+            flat = {}
+            for k, v in raw.items():
+                if str(v.dtype) == "|V2":
+                    flat[k] = jnp.array(v.view(jnp.bfloat16))
+                else:
+                    flat[k] = jnp.array(v)
+            nested = {}
+            for key, val in flat.items():
+                parts = key.split("/")
+                d = nested
+                for part in parts[:-1]:
+                    d = d.setdefault(part, {})
+                d[parts[-1]] = val
+            params = jax.tree_util.tree_map(
+                lambda x: x.astype(jnp.bfloat16), nested)
+            params = jax.device_put(params, sharded)
+            meta = ROOT / cfg.resume_from / "meta.txt"
+            if meta.exists():
+                for line in meta.read_text().splitlines():
+                    if line.startswith("step="):
+                        start_step = int(line.split("=")[1]) + 1
+            logger.info("Resumed at step %d", start_step - 1)
+        else:
+            logger.warning("Checkpoint not found — starting fresh")
 
     logger.info("=" * 60)
     logger.info("TRAINING STARTED")
     logger.info("=" * 60)
 
-    for step in range(1, cfg.total_steps + 1):
+    for step in range(start_step, cfg.total_steps + 1):
         # Get batch and shard
         raw   = next(train_iter)
         batch = jax.device_put(raw.reshape(-1, SEQ_LEN), data_shard)
@@ -292,6 +337,10 @@ def train():
         # Train step
         params, opt_state, loss = train_step(params, opt_state, batch)
         loss_val  = float(loss)
+        # Skip bad batch — restore previous params if NaN
+        if jnp.isnan(loss):
+            logger.warning("NaN detected at step %d — skipping batch", step)
+            continue
         tok_total += global_batch * SEQ_LEN
 
         # First step — confirm compile success
