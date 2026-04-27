@@ -67,7 +67,7 @@ class Attention(nn.Module):
 
         scale = head_dim ** -0.5
         attn = (q @ k.transpose(0, 1, 3, 2)) * scale
-        causal = jnp.triu(jnp.full((T, T), -jnp.inf, dtype=jnp.float32), k=1)
+        causal = jnp.triu(jnp.full((T, T), -1e9, dtype=jnp.float32), k=1)
         attn = attn.astype(jnp.float32) + causal
         attn = jax.nn.softmax(attn, axis=-1).astype(x.dtype)
 
@@ -108,8 +108,7 @@ class MAX2Model(nn.Module):
         x = x.astype(dtype)
 
         cos, sin = precompute_rope(self.cfg.head_dim, T, self.cfg.rope_base)
-        cos = cos.astype(dtype)
-        sin = sin.astype(dtype)
+        # Keep RoPE in float32 — bfloat16 loses precision at high frequencies
 
         Block = (nn.remat(TransformerBlock)
                  if self.cfg.gradient_checkpointing
@@ -125,8 +124,9 @@ class MAX2Model(nn.Module):
 
 def compute_loss(logits, targets, pad_id=0):
     B, T, V = logits.shape
+    logits = jnp.clip(logits, -50, 50)
     log_probs = jax.nn.log_softmax(logits[:, :-1], axis=-1)
     labels    = targets[:, 1:]
     loss      = -log_probs[jnp.arange(B)[:, None], jnp.arange(T - 1)[None, :], labels]
     mask = (labels != pad_id).astype(jnp.float32)
-    return (loss * mask).sum() / jnp.maximum(mask.sum(), 1.0)
+    return (loss * mask).sum() / jnp.maximum(mask.sum(), 1.0
