@@ -280,7 +280,7 @@ step=   800 | loss=6.5927 | lr=2.40e-04 | 3888 tok/s
 
 This writeup is part of building **MAX** — a personal AI operating system built entirely from scratch. Custom tokenizer, custom architecture, custom training pipeline. No wrappers around existing models.
 
-- GitHub: [your github link]
+- GitHub: https://github.com/AsphaltProAT
 - Built by: Prashant Shewale, Pune, India
 
 If this helped you, star the repo. If you have questions, open an issue.
