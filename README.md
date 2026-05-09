@@ -1,6 +1,6 @@
 # Training a 7B Parameter Model on TPU v4-8 with JAX — Solving OOM and Sharding Errors
 
-> **Written by Atharva Shewale, Pune, India**  
+> **Written by Prashant Shewale, Pune, India**  
 > *Building MAX — a personal AI from scratch*
 
 ---
@@ -281,7 +281,7 @@ step=   800 | loss=6.5927 | lr=2.40e-04 | 3888 tok/s
 This writeup is part of building **MAX** — a personal AI operating system built entirely from scratch. Custom tokenizer, custom architecture, custom training pipeline. No wrappers around existing models.
 
 - GitHub: [your github link]
-- Built by: Atharva Shewale, Pune, India
+- Built by: Prashant Shewale, Pune, India
 
 If this helped you, star the repo. If you have questions, open an issue.
 
