@@ -262,7 +262,9 @@ step=   200 | loss=4.7362 | lr=6.00e-05 | 3887 tok/s
 step=   700 | loss=3.9635 | lr=2.10e-04 | 3886 tok/s
 step=   800 | loss=6.5927 | lr=2.40e-04 | 3888 tok/s
 ```
-
+---
+## Note-
+Data and tokenizer are streamed from private gcs buckets for IP protection. To run locally, update train_7b.py and data.py with your own tokenizer and gcs bucket respectively.
 ---
 
 ## Key Takeaways
